@@ -1,0 +1,6 @@
+@import "tailwindcss";
+
+html {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}

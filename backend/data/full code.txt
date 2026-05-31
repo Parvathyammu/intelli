@@ -1,0 +1,2240 @@
+graph_maker.py
+
+from neo4j import GraphDatabase
+import networkx as nx
+from pyvis.network import Network
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+URI = os.getenv("NEO4J_URI")
+USERNAME = os.getenv("NEO4J_USERNAME")
+PASSWORD = os.getenv("NEO4J_PASSWORD")
+
+driver = GraphDatabase.driver(URI, auth=(USERNAME, PASSWORD))
+
+def build_graph():
+    def run_query(tx):
+        result = tx.run("MATCH (n)-[r]->(m) RETURN n.name AS source, type(r) AS rel, m.name AS target")
+        G = nx.DiGraph()
+        for record in result:
+            G.add_edge(record["source"], record["target"], label=record["rel"])
+        return G
+
+    with driver.session() as session:
+        graph = session.read_transaction(run_query)
+    return graph
+
+def save_graph_as_html(graph, output_path="neo4j_graph.html"):
+    net = Network(notebook=False, directed=True)
+    net.from_nx(graph)
+
+    for node in net.nodes:
+        node["color"] = "#c27aff"
+        node["font"] = {"color": "#ffffff"}
+
+    net.save_graph(output_path)
+    print(f"Graph saved to: {output_path}")
+
+
+if __name__ == "__main__":
+    graph = build_graph()
+    save_graph_as_html(graph, "neo4j_graph.html")
+
+__________________________________________________________________
+
+ingestion-pipeline.py
+
+
+from dotenv import load_dotenv
+import os
+from triplet_extractor import TripletExtractor
+from triplet_ingestion import Neo4jTripletIngester
+import json
+
+load_dotenv()
+
+class TripletApp:
+    def __init__(self):
+        self.groq_api_key = os.getenv("GROQ_API_KEY")
+        if not self.groq_api_key:
+            raise ValueError("GROQ_API_KEY not found in environment variables")
+
+        self.neo4j_uri = os.getenv("NEO4J_URI")
+        self.neo4j_username = os.getenv("NEO4J_USERNAME")
+        self.neo4j_password = os.getenv("NEO4J_PASSWORD")
+        
+        if not all([self.neo4j_uri, self.neo4j_username, self.neo4j_password]):
+            raise ValueError("Neo4j credentials not found in environment variables")
+
+        self.extractor = TripletExtractor(api_key=self.groq_api_key)
+        self.ingester = Neo4jTripletIngester(
+            uri=self.neo4j_uri,
+            username=self.neo4j_username,
+            password=self.neo4j_password
+        )
+    
+    def process_text(self, text, clear_db=False, model="meta-llama/llama-4-maverick-17b-128e-instruct"):
+        try:
+            # print("🔍 Extracting triplets from text...")
+            # print(f"Text preview: {text[:200]}{'...' if len(text) > 200 else ''}")
+            # print("-" * 50)
+            
+            triplets = self.extractor.extract_triplets(text, model=model)
+            
+            if not triplets:
+                print("❌ No triplets extracted from the text")
+                return {"triplets": [], "stats": None, "success": False}
+            
+            # print(f"Extracted {len(triplets)} triplets:")
+            # for i, triplet in enumerate(triplets, 1):
+            #     print(f"  {i}. {triplet.get('subject', 'N/A')} → {triplet.get('predicate', 'N/A')} → {triplet.get('object', 'N/A')}")
+            
+            # print("\nIngesting triplets into Neo4j...")
+
+            if clear_db:
+                print("Clearing existing database...")
+                self.ingester.clear_database()
+
+            self.ingester.create_triplet_nodes_and_relationships(triplets)
+
+            stats = self.ingester.get_graph_stats()
+            
+            # print(f"Successfully ingested triplets!")
+            # print(f"Graph Stats:")
+            # print(f"   - Nodes: {stats['node_count']}")
+            # print(f"   - Relationships: {stats['relationship_count']}")
+            
+            return {
+                "triplets": triplets,
+                "stats": stats,
+                "success": True
+            }
+            
+        except Exception as e:
+            print(f"❌ Error processing text: {e}")
+            return {"triplets": [], "stats": None, "success": False, "error": str(e)}
+    
+    def query_graph(self, query):
+        try:
+            return self.ingester.query_graph(query)
+        except Exception as e:
+            print(f"❌ Error executing query: {e}")
+            return []
+    
+    def find_entity_connections(self, entity_name, depth=2):
+        try:
+            return self.ingester.find_connections(entity_name, depth)
+        except Exception as e:
+            print(f"❌ Error finding connections for {entity_name}: {e}")
+            return []
+    
+    def get_popular_entities(self, limit=10):
+        query = f"""
+            MATCH (n:Entity)-[r]-()
+            RETURN n.name as entity, count(r) as connection_count
+            ORDER BY connection_count DESC
+            LIMIT {limit}
+        """
+        return self.query_graph(query)
+    
+    def get_all_relationships(self):
+        query = """
+            MATCH (s:Entity)-[r]->(o:Entity)
+            RETURN s.name as subject, type(r) as predicate, o.name as object
+        """
+        return self.query_graph(query)
+    
+    def close(self):
+        self.ingester.close()
+
+def text_pipeline(file_name, passed):
+    with open(file_name, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    sample_text = data["text"]
+
+    try:
+        app = TripletApp()
+
+        result = app.process_text(sample_text)
+        
+        if result["success"]:
+            print("✅ Passed")
+            passed = passed + 1
+        
+        else:
+            print("❌ Failed to process text")
+            if "error" in result:
+                print(f"Error: {result['error']}")
+    
+    except Exception as e:
+        print(f"❌ Application error: {e}")
+    
+    finally:
+        if 'app' in locals():
+            app.close()
+
+
+# def main():
+#     sample_text = """
+#     About Us
+#     Space Applications Centre (SAC) is an ISRO Centre located at Ahmedabad, dealing with a wide variety of themes from satellite payload development, operational data reception and processing to societal applications. SAC is responsible for the development, realization and qualification of communication, navigation, earth observation and planetary payloads and related data processing and ground systems in the areas of communications, broadcasting, remote sensing and disaster monitoring / mitigation. Meteorological and Oceanographic Satellite Data Archival Centre (MOSDAC) is a Data Centre of Space Applications Centre (SAC) and has facility for satellite data reception, processing, analysis and dissemination. MOSDAC is operationally supplying earth observation data from Indian meteorology and oceanography satellites, to cater to national and international research requirements.
+#     """
+    
+#     try:
+#         app = TripletApp()
+
+#         result = app.process_text(sample_text, clear_db=True)
+        
+#         if result["success"]:
+#             print("\n" + "="*60)
+#             print("🔍 EXPLORING THE KNOWLEDGE GRAPH")
+#             print("="*60)
+            
+#             print("\n📋 All Relationships:")
+#             relationships = app.get_all_relationships()
+#             for rel in relationships[:10]:
+#                 print(f"  • {rel['subject']} --[{rel['predicate']}]--> {rel['object']}")
+            
+#             if len(relationships) > 10:
+#                 print(f"  ... and {len(relationships) - 10} more relationships")
+            
+#             print("\n🏆 Most Connected Entities:")
+#             popular = app.get_popular_entities(5)
+#             for entity in popular:
+#                 print(f"  • {entity['entity']}: {entity['connection_count']} connections")
+            
+#             if popular:
+#                 sample_entity = popular[0]['entity']
+#                 print(f"\n🔗 Connections for '{sample_entity}':")
+#                 connections = app.find_entity_connections(sample_entity, depth=2)
+#                 for conn in connections[:5]:  # Show first 5
+#                     print(f"  • Connected to: {conn['connected_name']} (distance: {conn['path_length']})")
+        
+#         else:
+#             print("❌ Failed to process text")
+#             if "error" in result:
+#                 print(f"Error: {result['error']}")
+    
+#     except Exception as e:
+#         print(f"❌ Application error: {e}")
+    
+#     finally:
+#         if 'app' in locals():
+#             app.close()
+
+if __name__ == "__main__":
+
+    directory = './mosdac_scraped'
+
+    passed = 0
+    total = 0
+
+    for filename in os.listdir(directory):
+        filepath = os.path.join(directory, filename)
+        if os.path.isfile(filepath):
+            text_pipeline(filepath, passed)
+            total = total + 1
+
+    print (f"Passed {passed}/{total}")
+
+___________________________________________________________________________________________________________________________________
+
+test.py
+
+import os
+import certifi
+from dotenv import load_dotenv
+from neo4j import GraphDatabase
+
+# --------------------------------------------------
+# Force Python to use certifi's CA bundle (Windows fix)
+# --------------------------------------------------
+os.environ["SSL_CERT_FILE"] = certifi.where()
+
+# --------------------------------------------------
+# Load .env from backend directory
+# --------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+# --------------------------------------------------
+# Debug: print env values (TEMPORARY, for testing)
+# --------------------------------------------------
+print("NEO4J_URI =", os.getenv("NEO4J_URI"))
+print("NEO4J_USERNAME =", os.getenv("NEO4J_USERNAME"))
+
+# --------------------------------------------------
+# Create Neo4j driver
+# --------------------------------------------------
+driver = GraphDatabase.driver(
+    os.getenv("NEO4J_URI"),
+    auth=(
+        os.getenv("NEO4J_USERNAME"),
+        os.getenv("NEO4J_PASSWORD")
+    )
+)
+
+# --------------------------------------------------
+# Test simple query
+# --------------------------------------------------
+try:
+    with driver.session() as session:
+        result = session.run("RETURN 1 AS test")
+        record = result.single()
+        print("Neo4j connection successful:", record)
+except Exception as e:
+    print("Neo4j connection FAILED:")
+    print(e)
+finally:
+    driver.close()
+
+____________________________________________________________________________________________________________
+triplet_extractor.py
+
+from groq import Groq
+import json
+import re
+from dotenv import load_dotenv
+import os
+
+class TripletExtractor:
+    def __init__(self, api_key=None):
+        self.client = Groq(api_key=api_key) if api_key else Groq()
+    
+    def extract_triplets(self, text, model="meta-llama/llama-4-maverick-17b-128e-instruct"):      
+        prompt = f"""Extract structured triplets (subject, predicate, object) from the following text. 
+        
+        IMPORTANT: Return ONLY a valid JSON array with no additional text, explanations, or formatting.
+        
+        Rules:
+        1. Each triplet should be in the format: (subject, predicate, object)
+        2. Subject and object should be nouns or objects or entities that can act as nodes of a graph database
+        3. Predicate should be a verb or verb phrase or prepositions describing the relationship between two nodes of a graph database
+        4. Extract only meaningful relationships
+        5. Return ONLY the JSON array, nothing else
+        
+        Text: "{text}"
+        
+        Expected output format (return only this, no explanations):
+        [{{"subject": "...", "predicate": "...", "object": "..."}}, {{"subject": "...", "predicate": "...", "object": "..."}}]
+        """
+        
+        try:
+            completion = self.client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert at extracting structured triplets from text for creation of graph databases. Always return valid JSON format."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0.1,
+                max_completion_tokens=1024,
+                top_p=0.9,
+                stream=False,
+                stop=None,
+            )
+            
+            response_content = completion.choices[0].message.content
+            
+            triplets = self._parse_triplets_from_response(response_content)
+            return triplets
+            
+        except Exception as e:
+            print(f"Error during API call: {e}")
+            return []
+    
+    def _parse_triplets_from_response(self, response_content):
+        try:
+            # Method 1: Find JSON within ```json code blocks
+            json_block_match = re.search(r'```json\s*(\[.*?\])\s*```', response_content, re.DOTALL)
+            if json_block_match:
+                json_str = json_block_match.group(1)
+                triplets = json.loads(json_str)
+                return triplets
+            
+            # Method 2: Find JSON within ``` code blocks (without json label)
+            code_block_match = re.search(r'```\s*(\[.*?\])\s*```', response_content, re.DOTALL)
+            if code_block_match:
+                json_str = code_block_match.group(1)
+                triplets = json.loads(json_str)
+                return triplets
+            
+            # Method 3: Find any JSON array in the response
+            json_match = re.search(r'\[(?:[^[\]]*|\[[^\]]*\])*\]', response_content, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                # Clean up the JSON string to remove any trailing incomplete parts
+                json_str = self._clean_json_string(json_str)
+                triplets = json.loads(json_str)
+                return triplets
+            
+            # Method 4: Try to parse the entire response as JSON
+            triplets = json.loads(response_content.strip())
+            return triplets
+        
+        except json.JSONDecodeError as e:
+            print(f"JSON parsing error: {e}")
+            print("Could not parse JSON from response. Raw response:")
+            print(response_content[:500] + "..." if len(response_content) > 500 else response_content)
+            return []
+        
+    def _clean_json_string(self, json_str):
+        lines = json_str.split('\n')
+        cleaned_lines = []
+        brace_count = 0
+        
+        for line in lines:
+            cleaned_lines.append(line)
+            brace_count += line.count('{') - line.count('}')
+
+            if brace_count == 0 and ']' in line:
+                break
+        
+        cleaned_json = '\n'.join(cleaned_lines)
+        
+        last_bracket = cleaned_json.rfind(']')
+        if last_bracket != -1:
+            cleaned_json = cleaned_json[:last_bracket + 1]
+        
+        return cleaned_json
+    
+    def format_triplets(self, triplets):
+        if not triplets:
+            return "No triplets extracted."
+        
+        formatted = "\nExtracted Triplets:\n" + "="*40 + "\n"
+        for i, triplet in enumerate(triplets, 1):
+            formatted += f"{i}. Subject: {triplet.get('subject', 'N/A')}\n"
+            formatted += f"   Predicate: {triplet.get('predicate', 'N/A')}\n"
+            formatted += f"   Object: {triplet.get('object', 'N/A')}\n"
+            formatted += "-" * 30 + "\n"
+        
+        return formatted
+
+if __name__ == "__main__":
+    load_dotenv()
+
+    api_key = os.getenv("GROQ_API_KEY")
+
+    extractor = TripletExtractor(api_key=api_key)
+    
+    sample_text = """
+    About Us\nSpace Applications Centre (SAC) is an ISRO Centre located at Ahmedabad, dealing with a wide variety of themes from satellite payload development, operational data reception and processing to societal applications. SAC is responsible for the development, realization and qualification of communication, navigation, earth observation and planetary payloads and related data processing and ground systems in the areas of communications, broadcasting, remote sensing and disaster monitoring / mitigation. Meteorological and Oceanographic Satellite Data Archival Centre (MOSDAC) is a Data Centre of Space Applications Centre (SAC) and has facility for satellite data reception, processing, analysis and dissemination. MOSDAC is operationally supplying earth observation data from Indian meteorology and oceanography satellites, to cater to national and international research requirements.
+    """
+    
+    print("Sample Text:")
+    print(sample_text)
+    print("\n" + "="*50)
+    
+    triplets = extractor.extract_triplets(sample_text)
+    print(extractor.format_triplets(triplets))
+
+
+____________________________________________________________________________________________________________________
+
+triplet_ingestion.py
+
+
+
+from neo4j import GraphDatabase
+from dotenv import load_dotenv
+import os
+from typing import List, Dict
+
+load_dotenv()
+
+URI = os.getenv("NEO4J_URI")
+USERNAME = os.getenv("NEO4J_USERNAME")
+PASSWORD = os.getenv("NEO4J_PASSWORD")
+
+AUTH = (USERNAME, PASSWORD)
+
+class Neo4jTripletIngester:
+    def __init__(self, uri, username, password):
+        self.driver = GraphDatabase.driver(uri, auth=(username, password))
+    
+    def close(self):
+        self.driver.close()
+    
+    def create_triplet_nodes_and_relationships(self, triplets: List[Dict]):
+        with self.driver.session() as session:
+            for triplet in triplets:
+                subject = triplet.get('subject', '').strip()
+                predicate = triplet.get('predicate', '').strip()
+                obj = triplet.get('object', '').strip()
+                
+                if subject and predicate and obj:
+                    session.run("""
+                        MERGE (s:Entity {name: $subject})
+                        MERGE (o:Entity {name: $object})
+                        MERGE (s)-[r:RELATES {type: $predicate}]->(o)
+                        """, 
+                        subject=subject, 
+                        object=obj, 
+                        predicate=predicate
+                    )
+    
+    def clear_database(self):
+        with self.driver.session() as session:
+            session.run("MATCH (n) DETACH DELETE n")
+    
+    def get_graph_stats(self):
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (n)
+                RETURN 
+                    count(n) as node_count,
+                    count{()-[]->()} as relationship_count,
+                    collect(distinct labels(n)) as node_labels
+            """)
+            return result.single()
+    
+    def query_graph(self, query: str):
+        with self.driver.session() as session:
+            result = session.run(query)
+            return [record for record in result]
+    
+    def find_connections(self, entity_name: str, depth: int = 2):
+        with self.driver.session() as session:
+            query = f"""
+                MATCH path = (start:Entity {{name: $entity_name}})-[*1..{depth}]-(connected)
+                RETURN path, connected.name as connected_name, length(path) as path_length
+            """
+            result = session.run(query, entity_name=entity_name)
+            return [record for record in result]
+
+# def main():
+#     # Sample triplets (replace with your actual triplets)
+#     sample_triplets = [
+#         {"subject": "John", "predicate": "works at", "object": "Google"},
+#         {"subject": "John", "predicate": "lives in", "object": "San Francisco"},
+#         {"subject": "John", "predicate": "lives with", "object": "his wife Sarah"},
+#         {"subject": "Google", "predicate": "is", "object": "a technology company"},
+#         {"subject": "Google", "predicate": "founded by", "object": "Larry Page and Sergey Brin"},
+#         {"subject": "Sarah", "predicate": "teaches", "object": "mathematics"},
+#         {"subject": "Sarah", "predicate": "teaches at", "object": "Stanford University"}
+#     ]
+    
+#     # Initialize Neo4j connection
+#     # Replace with your actual Neo4j credentials
+#     ingester = Neo4jTripletIngester(
+#         uri=URI,
+#         username=USERNAME,
+#         password=PASSWORD
+#     )
+    
+#     try:
+#         # CLEAR EXISTING DATA
+#         # ingester.clear_database()
+    
+#         print("Ingesting triplets into Neo4j...")
+#         ingester.create_triplet_nodes_and_relationships(sample_triplets)
+        
+#         stats = ingester.get_graph_stats()
+#         print(f"Graph stats: {stats}")
+        
+#         print("\nExample queries:")
+        
+#         john_connections = ingester.find_connections("John")
+#         print(f"John's connections: {len(john_connections)} paths found")
+#         for conn in john_connections:
+#             print(f"  - Connected to: {conn['connected_name']} (distance: {conn['path_length']})")
+
+#         all_relationships = ingester.query_graph("""
+#             MATCH (s:Entity)-[r]->(o:Entity)
+#             RETURN s.name as subject, type(r) as predicate, o.name as object
+#         """)
+#         print(f"\nAll relationships:")
+#         for rel in all_relationships:
+#             print(f"  - {rel['subject']} --[{rel['predicate']}]--> {rel['object']}")
+        
+#         popular_entities = ingester.query_graph("""
+#             MATCH (n:Entity)-[r]-()
+#             RETURN n.name as entity, count(r) as connection_count
+#             ORDER BY connection_count DESC
+#             LIMIT 5
+#         """)
+#         print(f"\nMost connected entities:")
+#         for entity in popular_entities:
+#             print(f"  - {entity['entity']}: {entity['connection_count']} connections")
+        
+#     except Exception as e:
+#         print(f"Error: {e}")
+    
+#     finally:
+#         ingester.close()
+
+if __name__ == "__main__":
+    # main()
+    pass
+
+
+
+
+_________________________________________________________________________________________________________
+
+web-scraper.py
+
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import json
+import os
+
+def get_content_text(url):
+    try:
+        res = requests.get(url, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        content_div = soup.find('div', id='content')
+        sidebar_div = soup.find('div', id='sidebar-first')
+
+        if not content_div:
+            print(f"❌ No <div id='content'> found in {url}")
+            return "", []
+        
+        if not sidebar_div:
+            print(f"❌ No <div id='sidebar'> found in {url}")
+
+        text = content_div.get_text(separator='\n', strip=True)
+
+        content_links = content_div.find_all('a', href=True)
+        sidebar_links = sidebar_div.find_all('a', href=True) if sidebar_div else []
+
+        links = [urljoin(url, a['href']) for a in content_links + sidebar_links]
+        
+        return text, links
+
+    except Exception as e:
+        print(f"❌ Failed to fetch {url}: {e}")
+        return "", []
+
+def crawl_from_root(root_url, domain_limit=True, file_limit=100):
+    visited = set()
+    to_visit = [root_url]
+    files = 0
+
+    while to_visit and files < file_limit:
+        current_url = to_visit.pop(0)
+        if current_url in visited:
+            continue
+
+        visited.add(current_url)
+        print(f"Visiting: {current_url}")
+
+        text, links = get_content_text(current_url)
+
+        # print(f"✅ Extracted {len(text)} characters from {current_url}")
+        save_page_text(current_url, text)
+        files = files + 1
+
+        for link in links:
+            full_url = urljoin(current_url, link)
+
+            if domain_limit:
+                if urlparse(full_url).netloc != urlparse(root_url).netloc:
+                    continue
+
+            if full_url not in visited:
+                to_visit.append(full_url)
+
+os.makedirs("mosdac_scraped", exist_ok=True)
+
+import re
+
+def make_safe_filename(url):
+    name = url.replace("https://", "").replace("http://", "")
+    name = re.sub(r'[<>:"/\\|?*#=]', '_', name)
+    return name[:150]
+
+def save_page_text(url, text):
+    safe_name = make_safe_filename(url)
+    filename = f"mosdac_scraped/{safe_name}.json"
+
+    data = {
+        "url": url,
+        "text": text
+    }
+
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    print(f"💾 Saved: {filename}")
+
+crawl_from_root("https://mosdac.gov.in/sitemap")
+
+# text, link = get_content_text("https://mosdac.gov.in/insat-3dr")
+
+# print(link)
+
+
+__________________________________________________________________________________________________________
+
+retriever_engine.py
+
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_community.document_loaders import TextLoader
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
+
+load_dotenv()
+
+class SemanticRAG:
+    def __init__(self):
+        self.vectorstore_path = "chroma_store"
+        self.embedding = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        self.llm = ChatGroq(
+            groq_api_key=os.getenv("GROQ_API_KEY"),
+            model_name="meta-llama/llama-4-maverick-17b-128e-instruct"
+        )
+
+        if not os.path.exists(self.vectorstore_path):
+            self._create_vectorstore()
+
+        self.vectorstore = Chroma(
+            persist_directory=self.vectorstore_path,
+            embedding_function=self.embedding
+        )
+
+    def _create_vectorstore(self):
+        docs_path = "data/documents"
+        text_files = list(Path(docs_path).glob("*.txt"))
+
+        raw_docs = []
+        for file_path in text_files:
+            loader = TextLoader(str(file_path), encoding="utf-8")
+            raw_docs.extend(loader.load())
+
+        if not raw_docs:
+            raise ValueError("No documents found for semantic RAG. Please add .txt files to data/documents.")
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+        split_docs = splitter.split_documents(raw_docs)
+
+        if not split_docs:
+            raise ValueError("Splitting failed. Are your .txt files empty?")
+
+        Chroma.from_documents(split_docs, self.embedding, persist_directory=self.vectorstore_path)
+
+    def retrieve_context(self, query, k=3):
+        docs = self.vectorstore.similarity_search(query, k=k)
+        return "\n".join([doc.page_content for doc in docs])
+
+    def generate_answer(self, query, context):
+        prompt = f"""
+Answer the following question based only on the context provided.
+
+Context:
+{context}
+
+Question: {query}
+Answer:
+"""
+        return self.llm.invoke(prompt).content.strip()
+
+    def process_query(self, query):
+        context = self.retrieve_context(query)
+        return self.generate_answer(query, context)
+
+
+_________________________________________________________________________________________________________
+
+graph_query_engine.py
+
+
+from langchain_groq import ChatGroq
+from neo4j import GraphDatabase
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class GraphRAG:
+    def __init__(self):
+        self.llm = ChatGroq(
+            groq_api_key=os.getenv("GROQ_API_KEY"),
+            model_name="meta-llama/llama-4-maverick-17b-128e-instruct",
+            temperature=0.1
+        )
+        self.driver = GraphDatabase.driver(
+            os.getenv("NEO4J_URI"),
+            auth=(os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD"))
+        )
+
+    def generate_cypher(self, query):
+        prompt = f"""
+You are an expert at querying a Neo4j knowledge graph.
+
+Translate the following natural language question into a Cypher query.
+
+- Nodes are labeled `Entity`
+- Relationships are labeled `RELATES`, and each has an optional `type` property.
+- Always use one relationship at a time in each MATCH clause. Avoid patterns that return a list of relationships.
+- Use MATCH, WHERE, RETURN clauses only.
+- Return the Cypher query only. No markdown, no explanation.
+
+Question: "{query}"
+Cypher:
+"""
+        raw_output = self.llm.invoke(prompt).content.strip()
+
+        # Clean up markdown code block if present
+        if raw_output.startswith("```"):
+            raw_output = raw_output.strip("`").split("\n", 1)[-1].strip()
+            if raw_output.endswith("```"):
+                raw_output = raw_output[:-3].strip()
+
+        return raw_output
+
+    def run_cypher(self, cypher_query):
+        with self.driver.session() as session:
+            result = session.run(cypher_query)
+            return [record.data() for record in result]
+
+    def generate_answer(self, query, cypher_results):
+        prompt = f"""
+Based on the data returned from the knowledge graph below, answer the user's question:
+
+Question: {query}
+Graph Data: {cypher_results}
+Answer:
+"""
+        return self.llm.invoke(prompt).content.strip()
+
+    def process_query(self, user_query):
+        cypher_query = self.generate_cypher(user_query)
+        print(f"[Generated Cypher Query]\n{cypher_query}\n")
+
+        try:
+            result = self.run_cypher(cypher_query)
+        except Exception as e:
+            print(f"[Cypher Execution Error] {e}")
+            raise
+
+        if not result:
+            return None  # return None to signal failure
+
+        return self.generate_answer(user_query, result)
+
+    def close(self):
+        self.driver.close()
+
+
+
+
+____________________________________________________________________________________________________________________________
+
+backend_with_faiss.py
+
+
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from neo4j import GraphDatabase
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+import os
+from dotenv import load_dotenv
+import json
+import requests
+from typing import List, Dict
+
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)
+
+allowed_origin = os.getenv("FRONTEND_URL")
+CORS(app, origins=[allowed_origin] if allowed_origin else "*")
+
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FAISS_INDEX_PATH = os.path.join(BASE_DIR, "faiss_index")
+
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
+llm = ChatGroq(
+    groq_api_key=GROQ_API_KEY,
+    model_name="llama-3.1-8b-instant",
+    temperature=0.1,
+)
+
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+vector_store = None
+entity_cache = {}
+relationship_cache = {}
+
+import os
+
+def initialize_vector_store(force_rebuild=False):
+    global vector_store, entity_cache, relationship_cache
+
+    try:
+        if os.path.exists(FAISS_INDEX_PATH) and not force_rebuild:
+            print("Loading FAISS index from disk...")
+            vector_store = FAISS.load_local(FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
+            print("FAISS index loaded.")
+            return
+        
+        print("Building FAISS index from Neo4j...")
+
+        entities = get_all_entities()
+        entity_cache = {entity['name'].lower(): entity for entity in entities}
+
+        relationships = get_all_relationship_types()
+        relationship_cache = {rel['type'].lower(): rel for rel in relationships}
+
+        documents = []
+
+        for entity in entities:
+            doc = Document(
+                page_content=f"Entity: {entity['name']} {entity.get('description', '') or ''}",
+                metadata={"type": "entity", "name": entity['name'], "id": entity.get('id')}
+            )
+            documents.append(doc)
+
+        for rel in relationships:
+            doc = Document(
+                page_content=f"Relationship: {rel['type']}",
+                metadata={"type": "relationship", "name": rel['type']}
+            )
+            documents.append(doc)
+
+        if documents:
+            vector_store = FAISS.from_documents(documents, embeddings)
+            print(f"Vector store initialized with {len(documents)} documents")
+
+            vector_store.save_local(FAISS_INDEX_PATH)
+            print("FAISS index saved to disk.")
+        else:
+            print("No documents found to create vector store.")
+
+    except Exception as e:
+        print(f"Error initializing vector store: {e}")
+
+
+def fetch_weather_for_city(city: str):
+    """Fetch current weather and upcoming rain alerts for a city using OpenWeatherMap."""
+    if not OPENWEATHER_API_KEY:
+        raise RuntimeError("OpenWeatherMap API key not configured (OPENWEATHER_API_KEY).")
+
+    params = {
+        "q": city,
+        "appid": OPENWEATHER_API_KEY,
+        "units": "metric",
+    }
+    url = "https://api.openweathermap.org/data/2.5/weather"
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Forecast for rain alerts
+    forecast_url = "https://api.openweathermap.org/data/2.5/forecast"
+    upcoming_rain = False
+    try:
+        forecast_resp = requests.get(forecast_url, params=params, timeout=10)
+        if forecast_resp.status_code == 200:
+            forecast_data = forecast_resp.json()
+            for item in forecast_data.get("list", [])[:8]:
+                weather_main = item.get("weather", [{}])[0].get("main", "").lower()
+                weather_desc = item.get("weather", [{}])[0].get("description", "").lower()
+                if "rain" in weather_main or "rain" in weather_desc or "drizzle" in weather_main or "storm" in weather_main:
+                    upcoming_rain = True
+                    break
+    except Exception as e:
+        print(f"Error fetching forecast: {e}")
+
+    # Simplify response for frontend
+    simplified = {
+        "city": data.get("name"),
+        "country": data.get("sys", {}).get("country"),
+        "weather": data.get("weather", [{}])[0].get("description"),
+        "temperature_c": data.get("main", {}).get("temp"),
+        "feels_like_c": data.get("main", {}).get("feels_like"),
+        "humidity": data.get("main", {}).get("humidity"),
+        "upcoming_rain": upcoming_rain
+    }
+    return simplified
+
+def is_weather_query(query: str) -> bool:
+    weather_keywords = ['weather', 'temperature', 'forecast', 'rain', 'sunny', 'climate', 'how hot', 'how cold', 'raining', 'snowing', 'crop', 'sow', 'harvest', 'manure', 'fertilizer', 'wheat', 'barley', 'rice', 'agriculture']
+    query_lower = query.lower()
+    return any(keyword in query_lower for keyword in weather_keywords)
+
+def handle_weather_query(query: str) -> str:
+    prompt = f"""
+You are an intelligent assistant. Extract the city name from the following weather-related question.
+If the question does not contain a specific city, return "UNKNOWN".
+Only output the city name — do NOT add explanation, whitespace, or punctuation.
+
+Question: {query}
+"""
+    city = llm.invoke(prompt).content.strip()
+    
+    if city and city.upper() != "UNKNOWN":
+        try:
+            weather_data = fetch_weather_for_city(city)
+            desc = weather_data.get('weather', 'unknown conditions')
+            temp = weather_data.get('temperature_c', 'N/A')
+            feels = weather_data.get('feels_like_c', 'N/A')
+            humidity = weather_data.get('humidity', 'N/A')
+            name = weather_data.get('city', city)
+            country = weather_data.get('country', '')
+            upcoming_rain = weather_data.get('upcoming_rain', False)
+            
+            location = f"{name}, {country}" if country else name
+            rain_alert_str = "There is rain expected in the next 24 hours." if upcoming_rain else "No rain expected in the next 24 hours."
+            
+            advice_prompt = f"""
+You are an expert assistant. The user has been provided with the current weather in {location} ({desc}, {temp}°C, humidity: {humidity}%).
+
+STRICT INSTRUCTIONS:
+1. No-Disclaimer Policy: Provide direct answers without any meta-commentary about your purpose or agricultural focus. Do NOT say things like "I'm here to provide agricultural advice...".
+2. Only provide agricultural advice if the user's query specifically asks about farming, crops, or soil.
+3. If the user only asks about the weather and does not ask about farming/crops/soil, you MUST output exactly an empty string (no text at all).
+4. Do not repeat the weather conditions or forecast.
+
+User's Question: {query}
+"""
+            advice = llm.invoke(advice_prompt).content.strip()
+            if advice:
+                return f"The current weather in {location} is {desc} with a temperature of {temp}°C (feels like {feels}°C) and {humidity}% humidity. {rain_alert_str}\n\n{advice}"
+            else:
+                return f"The current weather in {location} is {desc} with a temperature of {temp}°C (feels like {feels}°C) and {humidity}% humidity. {rain_alert_str}"
+        except Exception as e:
+            return f"⚠️ I couldn't fetch the weather for {city}. (Error: {str(e)})"
+    
+    return "Please specify a city to get the weather for."
+
+
+def get_all_entities():
+    """Get all entities from Neo4j"""
+    with driver.session() as session:
+        result = session.run("""
+            MATCH (n)
+            WHERE n.name IS NOT NULL
+            RETURN n.name as name, elementId(n) as id, n
+        """)
+        return [record.data() for record in result]
+
+def get_all_relationship_types():
+    """Get all relationship types from Neo4j"""
+    with driver.session() as session:
+        result = session.run("""
+            MATCH ()-[r]->()
+            RETURN DISTINCT type(r) as type
+        """)
+        return [record.data() for record in result]
+
+def extract_entities_from_query(query: str) -> List[str]:
+    """Extract potential entities from user query using LLM"""
+    prompt = f"""
+Extract all entities, concepts, names, and important terms from the following query.
+Return them as a simple comma-separated list with no explanations.
+
+Query: {query}
+
+Entities:"""
+    
+    response = llm.invoke(prompt).content.strip()
+
+    entities = []
+    for entity in response.split(','):
+        entity = entity.strip().strip('"').strip("'")
+        if entity and len(entity) > 1:
+            entities.append(entity)
+    
+    return entities
+
+def find_matching_entities(extracted_entities: List[str]) -> List[Dict]:
+    matched_entities = []
+    
+    for entity in extracted_entities:
+        if entity.lower() in entity_cache:
+            matched_entities.append({
+                "original": entity,
+                "matched": entity_cache[entity.lower()]['name'],
+                "type": "entity",
+                "confidence": 1.0
+            })
+        else:
+            search_results = semantic_search(entity, k=3)
+            for result in search_results:
+                if result["type"] == "entity":
+                    matched_entities.append({
+                        "original": entity,
+                        "matched": result["name"],
+                        "type": "entity",
+                        "confidence": 0.8
+                    })
+                    break
+    
+    return matched_entities
+
+def semantic_search(query: str, k: int = 10) -> List[Dict]:
+    """Perform semantic search to find relevant entities and relationships"""
+    if not vector_store:
+        return []
+    
+    try:
+        docs = vector_store.similarity_search(query, k=k)
+        
+        results = []
+        for doc in docs:
+            results.append({
+                "content": doc.page_content,
+                "metadata": doc.metadata,
+                "type": doc.metadata.get("type"),
+                "name": doc.metadata.get("name")
+            })
+        
+        return results
+    except Exception as e:
+        print(f"Error in semantic search: {e}")
+        return []
+
+def execute_query_with_proper_fallback(query: str, matched_entities: List[Dict]) -> tuple:
+    with driver.session() as session:
+        
+        if matched_entities:
+            entity_name = matched_entities[0]["matched"]
+            
+            relationship_query = f"""
+            MATCH (n)-[r]-(m) 
+            WHERE toLower(n.name) = toLower('{entity_name}') 
+            RETURN n, type(r) as relationship_type, m
+            """
+            
+            print(f"Executing relationship query: {relationship_query}")
+            
+            try:
+                result = session.run(relationship_query)
+                data = [record.data() for record in result]
+                
+                if data:
+                    print(f"Found {len(data)} relationships for {entity_name}")
+                    return data, "entity_relationships"
+                else:
+                    print(f"No relationships found for {entity_name}, checking if entity exists...")
+                    
+                    entity_query = f"""
+                    MATCH (n) 
+                    WHERE toLower(n.name) = toLower('{entity_name}') 
+                    RETURN n
+                    """
+                    
+                    entity_result = session.run(entity_query)
+                    entity_data = [record.data() for record in entity_result]
+                    
+                    if entity_data:
+                        print(f"Entity {entity_name} exists but has no relationships")
+                        return entity_data, "entity_no_relationships"
+                    else:
+                        print(f"Entity {entity_name} not found")
+                        return get_all_relationships(session)
+                        
+            except Exception as e:
+                print(f"Error executing relationship query: {e}")
+                return get_all_relationships(session)
+        
+        else:
+            print("No matched entities found, returning all relationships")
+            return get_all_relationships(session)
+
+def get_all_relationships(session):
+    try:
+        all_relationships_query = """
+        MATCH (n)-[r]->(m) 
+        RETURN n, type(r) as relationship_type, m 
+        LIMIT 20
+        """
+        
+        print("Executing query for all relationships")
+        result = session.run(all_relationships_query)
+        data = [record.data() for record in result]
+        
+        if data:
+            print(f"Found {len(data)} general relationships")
+            return data, "all_relationships"
+        else:
+            print("No relationships found in the entire graph")
+            return [], "no_data"
+            
+    except Exception as e:
+        print(f"Error getting all relationships: {e}")
+        return [], "error"
+
+def generate_answer(question: str, graph_data: List[Dict], query_type: str) -> str:
+
+    if not graph_data:
+        return "No data found in the knowledge graph."
+
+    limited_data = graph_data[:10]
+    
+    try:
+        graph_json = json.dumps(limited_data, indent=2, default=str)
+    except:
+        graph_json = str(limited_data)
+    
+    if query_type == "entity_relationships":
+        prompt = f"""
+Based on the knowledge graph data below, answer the user's question directly and concisely.
+
+User's question: {question}
+
+Knowledge graph data:
+{graph_json}
+
+Instructions:
+- Answer based ONLY on the provided graph data
+- Be direct and concise
+- Do not add external knowledge
+- If the data shows relationships, describe them clearly
+- If asking about a specific entity, focus on what the data shows about that entity
+
+Answer:"""
+
+    elif query_type == "entity_no_relationships":
+        prompt = f"""
+The entity from the user's question exists in the knowledge graph but has no relationships with other entities.
+
+User's question: {question}
+
+Entity data:
+{graph_json}
+
+Provide a brief response indicating that the entity exists but has no connections in the current knowledge graph.
+
+Answer:"""
+
+    elif query_type == "all_relationships":
+        prompt = f"""
+The user asked about something not specifically found in the knowledge graph. Here are the available relationships in the knowledge graph:
+
+User's question: {question}
+
+Available relationships:
+{graph_json}
+
+Instructions:
+- Mention that the specific entity/concept wasn't found
+- Briefly describe what relationships are available in the knowledge graph
+- Be concise and factual
+
+Answer:"""
+
+    else:
+        prompt = f"""
+Answer the user's question based on the available knowledge graph data:
+
+User's question: {question}
+
+Data:
+{graph_json}
+
+Answer:"""
+    
+    try:
+        response = llm.invoke(prompt).content.strip()
+        return response if response else "Unable to generate answer from the available data."
+    except Exception as e:
+        print(f"Error generating answer: {e}")
+        return "Sorry, I encountered an error while generating the answer."
+
+@app.route('/ask', methods=['POST'])
+def ask():
+    try:
+        data = request.get_json()
+        query = data.get('query', '').strip()
+        
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+            
+        if is_weather_query(query):
+            weather_answer = handle_weather_query(query)
+            return jsonify({
+                "answer": weather_answer,
+                "debug": {
+                    "extracted_entities": [],
+                    "matched_entities": [],
+                    "query_type": "weather",
+                    "result_count": 0
+                }
+            })
+        
+        if not vector_store:
+            initialize_vector_store()
+        
+        extracted_entities = extract_entities_from_query(query)
+        print(f"Extracted entities: {extracted_entities}")
+        
+        matched_entities = find_matching_entities(extracted_entities)
+        print(f"Matched entities: {matched_entities}")
+        
+        result, query_type = execute_query_with_proper_fallback(query, matched_entities)
+        
+        final_answer = generate_answer(query, result, query_type)
+        
+        return jsonify({
+            "answer": final_answer,
+            "debug": {
+                "extracted_entities": extracted_entities,
+                "matched_entities": matched_entities,
+                "query_type": query_type,
+                "result_count": len(result)
+            }
+        })
+            
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Error processing query: {str(e)}"}), 500
+
+@app.route('/refresh-vector-store', methods=['POST'])
+def refresh_vector_store():
+    try:
+        initialize_vector_store(force_rebuild=True)
+        return jsonify({"message": "Vector store refreshed and saved successfully"})
+    except Exception as e:
+        return jsonify({"error": f"Error refreshing vector store: {str(e)}"}), 500
+
+if __name__ == '__main__':
+    initialize_vector_store()
+    app.run(debug=True)
+
+
+________________________________________________________________________________________________________________
+backend_multilingual.py
+
+
+
+
+
+
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import networkx as nx
+import matplotlib.pyplot as plt
+from neo4j import GraphDatabase
+from langchain_groq import ChatGroq
+import os
+from dotenv import load_dotenv
+import json
+import requests
+from langdetect import detect, LangDetectException
+import googletrans
+
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)
+
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
+NEO4J_PASSWORD: str | None = os.getenv("NEO4J_PASSWORD")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
+llm = ChatGroq(
+    groq_api_key=GROQ_API_KEY,
+    model_name="llama-3.1-8b-instant",
+    temperature=0.1,
+)
+
+# Initialize translator
+translator = googletrans.Translator()
+
+# Language mapping for consistent detection
+LANGUAGE_CODES = {
+    'en': 'en',
+    'hi': 'hi',
+    'es': 'es',
+    'fr': 'fr',
+    'de': 'de',
+    'zh-cn': 'zh-CN',
+    'ja': 'ja',
+    'pt': 'pt'
+}
+
+def detect_language(text):
+    """Detect the language of the input text"""
+    try:
+        lang = detect(text)
+        return lang if lang in LANGUAGE_CODES.values() else 'en'
+    except LangDetectException:
+        return 'en'
+
+def translate_text(text, source_lang='en', target_lang='en'):
+    """Translate text from source language to target language"""
+    if source_lang == target_lang or target_lang == 'en':
+        return text
+    
+    try:
+        result = translator.translate(text, src_language=source_lang, dest_language=target_lang)
+        return result['translatedText'] if isinstance(result, dict) else result.text
+    except Exception as e:
+        print(f"Translation error: {e}")
+        return text
+
+def generate_cypher(nl_query, language='en'):
+    """Generate Cypher query from natural language with language context"""
+    language_name = {
+        'en': 'English',
+        'hi': 'Hindi',
+        'es': 'Spanish',
+        'fr': 'French',
+        'de': 'German',
+        'zh-CN': 'Chinese',
+        'ja': 'Japanese',
+        'pt': 'Portuguese'
+    }.get(language, 'English')
+    
+    prompt = f"""
+You are a Cypher expert. Convert the following natural language question into a single valid Cypher query.
+
+The question is in {language_name}.
+
+Only output the query — do NOT add explanation, markdown, or commentary.
+
+- Node Label: Entity
+- Relationship: RELATES with a property `type`
+
+Question: {nl_query}
+"""
+    response = llm.predict(prompt).strip()
+
+    for line in response.splitlines():
+        if line.strip().startswith("MATCH"):
+            return response.strip()
+    return ""
+
+def run_cypher(cypher_query):
+    """Execute Cypher query against Neo4j database"""
+    try:
+        with driver.session() as session:
+            result = session.run(cypher_query)
+            return [record.data() for record in result]
+    except Exception as e:
+        print(f"Cypher execution error: {e}")
+        return []
+
+def fetch_weather_for_city(city: str):
+    """Fetch current weather and upcoming rain alerts for a city using OpenWeatherMap."""
+    if not OPENWEATHER_API_KEY:
+        raise RuntimeError("OpenWeatherMap API key not configured (OPENWEATHER_API_KEY).")
+
+    params = {
+        "q": city,
+        "appid": OPENWEATHER_API_KEY,
+        "units": "metric",
+    }
+    url = "https://api.openweathermap.org/data/2.5/weather"
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Forecast for rain alerts
+    forecast_url = "https://api.openweathermap.org/data/2.5/forecast"
+    upcoming_rain = False
+    try:
+        forecast_resp = requests.get(forecast_url, params=params, timeout=10)
+        if forecast_resp.status_code == 200:
+            forecast_data = forecast_resp.json()
+            for item in forecast_data.get("list", [])[:8]:
+                weather_main = item.get("weather", [{}])[0].get("main", "").lower()
+                weather_desc = item.get("weather", [{}])[0].get("description", "").lower()
+                if "rain" in weather_main or "rain" in weather_desc or "drizzle" in weather_main or "storm" in weather_main:
+                    upcoming_rain = True
+                    break
+    except Exception as e:
+        print(f"Error fetching forecast: {e}")
+
+    # Simplify response for frontend
+    simplified = {
+        "city": data.get("name"),
+        "country": data.get("sys", {}).get("country"),
+        "weather": data.get("weather", [{}])[0].get("description"),
+        "temperature_c": data.get("main", {}).get("temp"),
+        "feels_like_c": data.get("main", {}).get("feels_like"),
+        "humidity": data.get("main", {}).get("humidity"),
+        "upcoming_rain": upcoming_rain
+    }
+    return simplified
+
+def is_weather_query(query: str) -> bool:
+    weather_keywords = ['weather', 'temperature', 'forecast', 'rain', 'sunny', 'climate', 'how hot', 'how cold', 'raining', 'snowing', 'crop', 'sow', 'harvest', 'manure', 'fertilizer', 'wheat', 'barley', 'rice', 'agriculture']
+    query_lower = query.lower()
+    return any(keyword in query_lower for keyword in weather_keywords)
+
+def handle_weather_query(query: str) -> str:
+    prompt = f"""
+You are an intelligent assistant. Extract the city name from the following weather-related question.
+If the question does not contain a specific city, return "UNKNOWN".
+Only output the city name — do NOT add explanation, whitespace, or punctuation.
+
+Question: {query}
+"""
+    city = llm.predict(prompt).strip()
+    
+    if city and city.upper() != "UNKNOWN":
+        try:
+            weather_data = fetch_weather_for_city(city)
+            desc = weather_data.get('weather', 'unknown conditions')
+            temp = weather_data.get('temperature_c', 'N/A')
+            feels = weather_data.get('feels_like_c', 'N/A')
+            humidity = weather_data.get('humidity', 'N/A')
+            name = weather_data.get('city', city)
+            country = weather_data.get('country', '')
+            upcoming_rain = weather_data.get('upcoming_rain', False)
+            
+            location = f"{name}, {country}" if country else name
+            rain_alert_str = "There is rain expected in the next 24 hours." if upcoming_rain else "No rain expected in the next 24 hours."
+            
+            advice_prompt = f"""
+You are an expert assistant. The user has been provided with the current weather in {location} ({desc}, {temp}°C, humidity: {humidity}%).
+
+STRICT INSTRUCTIONS:
+1. No-Disclaimer Policy: Provide direct answers without any meta-commentary about your purpose or agricultural focus. Do NOT say things like "I'm here to provide agricultural advice...".
+2. Only provide agricultural advice if the user's query specifically asks about farming, crops, or soil.
+3. If the user only asks about the weather and does not ask about farming/crops/soil, you MUST output exactly an empty string (no text at all).
+4. Do not repeat the weather conditions or forecast.
+
+User's Question: {query}
+"""
+            advice = llm.predict(advice_prompt).strip()
+            if advice:
+                return f"The current weather in {location} is {desc} with a temperature of {temp}°C (feels like {feels}°C) and {humidity}% humidity. {rain_alert_str}\n\n{advice}"
+            else:
+                return f"The current weather in {location} is {desc} with a temperature of {temp}°C (feels like {feels}°C) and {humidity}% humidity. {rain_alert_str}"
+        except Exception as e:
+            return f"⚠️ I couldn't fetch the weather for {city}. (Error: {str(e)})"
+    
+    return "Please specify a city to get the weather for."
+
+def generate_answer(question, graph_data, language='en'):
+    """Generate answer based on graph data with language awareness"""
+    try:
+        trimmed = graph_data[:5]
+        graph_summary = json.dumps(trimmed, indent=2)
+
+        prompt = f"""
+You are an AI assistant helping users answer questions based on knowledge graph data.
+
+Here is the user's question:
+{question}
+
+And here is relevant graph data (first 5 entries):
+{graph_summary}
+
+Based on the graph data, provide a direct and concise answer to the question above.
+Keep your response informative and well-structured.
+"""
+
+        answer = llm.predict(prompt).strip()
+        return answer if answer else "Sorry, I couldn't generate an answer from the current data."
+
+    except Exception as e:
+        return f"⚠️ Error generating answer: {str(e)}"
+
+
+@app.route('/ask', methods=['POST'])
+def ask():
+    """Main API endpoint for asking questions with multilingual support"""
+    try:
+        data = request.get_json()
+        query = data.get('query', '').strip()
+        target_language = data.get('language', 'en')
+        
+        if not query:
+            return jsonify({'error': 'Query is required'}), 400
+        
+        # Detect source language
+        source_language = detect_language(query)
+        
+        # Translate query to English for processing if needed
+        if source_language != 'en':
+            query_en = translate_text(query, source_language, 'en')
+        else:
+            query_en = query
+            
+        # Check if weather query
+        if is_weather_query(query_en):
+            weather_answer_en = handle_weather_query(query_en)
+            if target_language != 'en' and target_language in LANGUAGE_CODES.values():
+                answer_final = translate_text(weather_answer_en, 'en', target_language)
+            else:
+                answer_final = weather_answer_en
+            return jsonify({
+                'answer': answer_final,
+                'source_language': source_language,
+                'target_language': target_language,
+                'original_query': query,
+                'processed_query': query_en
+            })
+        
+        # Generate Cypher and get answer (in English)
+        cypher_query = generate_cypher(query_en, source_language)
+        graph_data = run_cypher(cypher_query) if cypher_query else []
+        answer_en = generate_answer(query_en, graph_data, source_language)
+        
+        # Translate answer to target language if different from English
+        if target_language != 'en' and target_language in LANGUAGE_CODES.values():
+            answer_final = translate_text(answer_en, 'en', target_language)
+        else:
+            answer_final = answer_en
+        
+        return jsonify({
+            'answer': answer_final,
+            'source_language': source_language,
+            'target_language': target_language,
+            'original_query': query,
+            'processed_query': query_en
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy', 'service': 'AskMOS Backend'})
+
+
+@app.route('/supported-languages', methods=['GET'])
+def supported_languages():
+    """Return list of supported languages"""
+    languages = {
+        'en': 'English',
+        'hi': 'Hindi',
+        'es': 'Spanish',
+        'fr': 'French',
+        'de': 'German',
+        'zh-CN': 'Chinese (Simplified)',
+        'ja': 'Japanese',
+        'pt': 'Portuguese'
+    }
+    return jsonify({'supported_languages': languages})
+
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
+
+_______________________________________________________________________________________________________________
+
+backend.py
+
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import networkx as nx
+import matplotlib.pyplot as plt
+from neo4j import GraphDatabase
+from langchain_groq import ChatGroq
+import os
+from dotenv import load_dotenv
+import json
+import requests
+
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)
+
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
+llm = ChatGroq(
+    groq_api_key=GROQ_API_KEY,
+    model_name="llama-3.1-8b-instant",
+    temperature=0.1,
+)
+
+def generate_cypher(nl_query):
+    prompt = f"""
+You are a Cypher expert. Convert the following natural language question into a single valid Cypher query.
+
+Only output the query — do NOT add explanation, markdown, or commentary.
+
+- Node Label: Entity
+- Relationship: RELATES with a property `type`
+
+Question: {nl_query}
+"""
+    response = llm.predict(prompt).strip()
+
+    for line in response.splitlines():
+        if line.strip().startswith("MATCH"):
+            return response.strip()
+    return ""
+
+def run_cypher(cypher_query):
+    with driver.session() as session:
+        result = session.run(cypher_query)
+        return [record.data() for record in result]
+
+
+def fetch_weather_for_city(city: str):
+    """Fetch current weather and upcoming rain alerts for a city using OpenWeatherMap."""
+    if not OPENWEATHER_API_KEY:
+        raise RuntimeError("OpenWeatherMap API key not configured (OPENWEATHER_API_KEY).")
+
+    params = {
+        "q": city,
+        "appid": OPENWEATHER_API_KEY,
+        "units": "metric",
+    }
+    url = "https://api.openweathermap.org/data/2.5/weather"
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Forecast for rain alerts
+    forecast_url = "https://api.openweathermap.org/data/2.5/forecast"
+    upcoming_rain = False
+    try:
+        forecast_resp = requests.get(forecast_url, params=params, timeout=10)
+        if forecast_resp.status_code == 200:
+            forecast_data = forecast_resp.json()
+            for item in forecast_data.get("list", [])[:8]:
+                weather_main = item.get("weather", [{}])[0].get("main", "").lower()
+                weather_desc = item.get("weather", [{}])[0].get("description", "").lower()
+                if "rain" in weather_main or "rain" in weather_desc or "drizzle" in weather_main or "storm" in weather_main:
+                    upcoming_rain = True
+                    break
+    except Exception as e:
+        print(f"Error fetching forecast: {e}")
+
+    # Simplify response for frontend
+    simplified = {
+        "city": data.get("name"),
+        "country": data.get("sys", {}).get("country"),
+        "weather": data.get("weather", [{}])[0].get("description"),
+        "temperature_c": data.get("main", {}).get("temp"),
+        "feels_like_c": data.get("main", {}).get("feels_like"),
+        "humidity": data.get("main", {}).get("humidity"),
+        "upcoming_rain": upcoming_rain
+    }
+    return simplified
+
+def is_weather_query(query: str) -> bool:
+    weather_keywords = ['weather', 'temperature', 'forecast', 'rain', 'sunny', 'climate', 'how hot', 'how cold', 'raining', 'snowing', 'crop', 'sow', 'harvest', 'manure', 'fertilizer', 'wheat', 'barley', 'rice', 'agriculture']
+    query_lower = query.lower()
+    return any(keyword in query_lower for keyword in weather_keywords)
+
+def handle_weather_query(query: str) -> str:
+    prompt = f"""
+You are an intelligent assistant. Extract the city name from the following weather-related question.
+If the question does not contain a specific city, return "UNKNOWN".
+Only output the city name — do NOT add explanation, whitespace, or punctuation.
+
+Question: {query}
+"""
+    city = llm.predict(prompt).strip()
+    
+    if city and city.upper() != "UNKNOWN":
+        try:
+            weather_data = fetch_weather_for_city(city)
+            desc = weather_data.get('weather', 'unknown conditions')
+            temp = weather_data.get('temperature_c', 'N/A')
+            feels = weather_data.get('feels_like_c', 'N/A')
+            humidity = weather_data.get('humidity', 'N/A')
+            name = weather_data.get('city', city)
+            country = weather_data.get('country', '')
+            upcoming_rain = weather_data.get('upcoming_rain', False)
+            
+            location = f"{name}, {country}" if country else name
+            rain_alert_str = "There is rain expected in the next 24 hours." if upcoming_rain else "No rain expected in the next 24 hours."
+            
+            advice_prompt = f"""
+You are an expert assistant. The user has been provided with the current weather in {location} ({desc}, {temp}°C, humidity: {humidity}%).
+
+STRICT INSTRUCTIONS:
+1. No-Disclaimer Policy: Provide direct answers without any meta-commentary about your purpose or agricultural focus. Do NOT say things like "I'm here to provide agricultural advice...".
+2. Only provide agricultural advice if the user's query specifically asks about farming, crops, or soil.
+3. If the user only asks about the weather and does not ask about farming/crops/soil, you MUST output exactly an empty string (no text at all).
+4. Do not repeat the weather conditions or forecast.
+
+User's Question: {query}
+"""
+            advice = llm.predict(advice_prompt).strip()
+            if advice:
+                return f"The current weather in {location} is {desc} with a temperature of {temp}°C (feels like {feels}°C) and {humidity}% humidity. {rain_alert_str}\n\n{advice}"
+            else:
+                return f"The current weather in {location} is {desc} with a temperature of {temp}°C (feels like {feels}°C) and {humidity}% humidity. {rain_alert_str}"
+        except Exception as e:
+            return f"⚠️ I couldn't fetch the weather for {city}. (Error: {str(e)})"
+    
+    return "Please specify a city to get the weather for."
+
+def generate_answer(question, graph_data):
+    try:
+        trimmed = graph_data[:5]
+        graph_summary = json.dumps(trimmed, indent=2)
+
+        prompt = f"""
+    You are an AI assistant helping users answer questions based on knowledge graph data.
+
+    Here is the user's question:
+    {question}
+
+    And here is relevant graph data (first 5 entries):
+    {graph_summary}
+
+    Based on the graph data, provide a direct and concise answer to the question above.
+    """
+
+        # Avoid specific phrasing the front-end should not display.
+        # Do not use the phrases 'related to', 'relates to', or 'is related to'.
+        # Use alternatives like 'connected to', 'associated with', or rephrase as a direct statement.
+        prompt += "\n\nDo not use the phrases 'related to', 'relates to', or 'is related to'. Use alternatives like 'connected to', 'associated with', or rephrase as a direct statement."
+
+        answer = llm.predict(prompt).strip()
+        return answer if answer else "Sorry, I couldn't generate an answer from the current data."
+
+    except Exception as e:
+        return f"⚠️ Error generating answer: {str(e)}"
+
+
+@app.route('/ask', methods=['POST'])
+def ask():
+    try:
+        data = request.get_json()
+        query = data.get('query', '').strip()
+        
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+            
+        if is_weather_query(query):
+            weather_answer = handle_weather_query(query)
+            return jsonify({"answer": weather_answer})
+        
+        cypher = generate_cypher(query)
+        
+        result = run_cypher(cypher)
+        
+        if result:
+            final_answer = generate_answer(query, result)
+            return jsonify({"answer": final_answer})
+        else:
+            return jsonify({"answer": "⚠️ No data found in the graph for this query."})
+            
+    except Exception as e:
+        return jsonify({"error": f"Error processing query: {str(e)}"}), 500
+
+
+
+@app.route('/weather', methods=['GET'])
+def weather():
+    """Return current weather for a given city.
+
+    Query params:
+      - city: name of the city (required)
+    """
+    try:
+        city = request.args.get('city', '').strip()
+        if not city:
+            return jsonify({"error": "city query parameter is required"}), 400
+
+        try:
+            data = fetch_weather_for_city(city)
+            return jsonify({"weather": data})
+        except requests.HTTPError as he:
+            return jsonify({"error": f"Weather API error: {str(he)}"}), 502
+        except Exception as e:
+            return jsonify({"error": f"Failed to fetch weather: {str(e)}"}), 500
+
+    except Exception as e:
+        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
+
+
+
+_________________________________________________________________________________
+tempCodeRunnerFile.py
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from neo4j import GraphDatabase
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.schema import Document
+import os
+from dotenv import load_dotenv
+import json
+from typing import List, Dict
+
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)
+
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
+llm = ChatGroq(
+    groq_api_key=GROQ_API_KEY,
+    model_name="meta-llama/llama-4-maverick-17b-128e-instruct",
+    temperature=0.1,
+)
+
+# Initialize embeddings model
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# Global variables for caching
+vector_store = None
+entity_cache = {}
+relationship_cache = {}
+
+def initialize_vector_store():
+    """Initialize vector store with all entities and relationships from Neo4j"""
+    global vector_store, entity_cache, relationship_cache
+    
+    try:
+        # Get all entities
+        entities = get_all_entities()
+        entity_cache = {entity['name'].lower(): entity for entity in entities}
+        
+        # Get all relationship types
+        relationships = get_all_relationship_types()
+        relationship_cache = {rel['type'].lower(): rel for rel in relationships}
+        
+        # Create documents for vector store
+        documents = []
+        
+        # Add entities to documents
+        for entity in entities:
+            doc = Document(
+                page_content=f"Entity: {entity['name']} {entity.get('description', '') or ''}",
+                metadata={"type": "entity", "name": entity['name'], "id": entity.get('id')}
+            )
+            documents.append(doc)
+        
+        # Add relationships to documents
+        for rel in relationships:
+            doc = Document(
+                page_content=f"Relationship: {rel['type']}",
+                metadata={"type": "relationship", "name": rel['type']}
+            )
+            documents.append(doc)
+        
+        # Create FAISS vector store
+        if documents:
+            vector_store = FAISS.from_documents(documents, embeddings)
+            print(f"Vector store initialized with {len(documents)} documents")
+        else:
+            print("No documents found to create vector store")
+            
+    except Exception as e:
+        print(f"Error initializing vector store: {e}")
+
+def get_all_entities():
+    """Get all entities from Neo4j"""
+    with driver.session() as session:
+        result = session.run("""
+            MATCH (n)
+            WHERE n.name IS NOT NULL
+            RETURN n.name as name, elementId(n) as id, n
+        """)
+        return [record.data() for record in result]
+
+def get_all_relationship_types():
+    """Get all relationship types from Neo4j"""
+    with driver.session() as session:
+        result = session.run("""
+            MATCH ()-[r]->()
+            RETURN DISTINCT type(r) as type
+        """)
+        return [record.data() for record in result]
+
+def extract_entities_from_query(query: str) -> List[str]:
+    """Extract potential entities from user query using LLM"""
+    prompt = f"""
+Extract all entities, concepts, names, and important terms from the following query.
+Return them as a simple comma-separated list with no explanations.
+
+Query: {query}
+
+Entities:"""
+    
+    response = llm.predict(prompt).strip()
+    
+    # Clean and split the response
+    entities = []
+    for entity in response.split(','):
+        entity = entity.strip().strip('"').strip("'")
+        if entity and len(entity) > 1:
+            entities.append(entity)
+    
+    return entities
+
+def extract_relationships_from_query(query: str) -> List[str]:
+    prompt = f"""
+Extract all possible relationship types, actions, or connection-related verbs from the following query.
+Return them as a simple comma-separated list with no explanations.
+
+Query: {query}
+
+Relationships:
+"""
+    response = llm.predict(prompt).strip()
+    relationships = [rel.strip().strip('"').strip("'") for rel in response.split(",") if len(rel.strip()) > 1]
+    return relationships
+
+def semantic_search(query: str, k: int = 10) -> List[Dict]:
+    """Perform semantic search to find relevant entities and relationships"""
+    if not vector_store:
+        return []
+    
+    try:
+        # Search for relevant documents
+        docs = vector_store.similarity_search(query, k=k)
+        
+        results = []
+        for doc in docs:
+            results.append({
+                "content": doc.page_content,
+                "metadata": doc.metadata,
+                "type": doc.metadata.get("type"),
+                "name": doc.metadata.get("name")
+            })
+        
+        return results
+    except Exception as e:
+        print(f"Error in semantic search: {e}")
+        return []
+
+def find_matching_entities(extracted_entities: List[str]) -> List[Dict]:
+    """Find matching entities in the knowledge graph"""
+    matched_entities = []
+    
+    for entity in extracted_entities:
+        # Direct match
+        if entity.lower() in entity_cache:
+            matched_entities.append({
+                "original": entity,
+                "matched": entity_cache[entity.lower()]['name'],
+                "type": "entity",
+                "confidence": 1.0
+            })
+        else:
+            # Semantic search for similar entities
+            search_results = semantic_search(entity, k=3)
+            for result in search_results:
+                if result["type"] == "entity":
+                    matched_entities.append({
+                        "original": entity,
+                        "matched": result["name"],
+                        "type": "entity",
+                        "confidence": 0.8  # Lower confidence for semantic matches
+                    })
+                    break
+    
+    return matched_entities
+
+def find_matching_relationships(query: str) -> List[Dict]:
+    matched_relationships = []
+
+    extracted_relationships = extract_relationships_from_query(query)
+    for rel in extracted_relationships:
+        search_results = semantic_search(rel, k=2)
+        for result in search_results:
+            if result["type"] == "relationship":
+                matched_relationships.append({
+                    "original": rel,
+                    "matched": result["name"],
+                    "type": "relationship",
+                    "confidence": 0.8
+                })
+                break
+
+    # fallback in case nothing was found
+    if not matched_relationships:
+        search_results = semantic_search(query, k=5)
+        for result in search_results:
+            if result["type"] == "relationship":
+                matched_relationships.append({
+                    "original": "query_context",
+                    "matched": result["name"],
+                    "type": "relationship",
+                    "confidence": 0.6
+                })
+    return matched_relationships
+
+def generate_cypher_with_entities(nl_query: str, matched_entities: List[Dict], matched_relationships: List[Dict]) -> str:
+    """Generate Cypher query with specific entity and relationship matches"""
+    
+    # Prepare context for the LLM
+    entity_context = ""
+    if matched_entities:
+        entity_names = [e["matched"] for e in matched_entities]
+        entity_context = f"Available entities: {', '.join(entity_names)}"
+    
+    relationship_context = ""
+    if matched_relationships:
+        rel_names = [r["matched"] for r in matched_relationships]
+        relationship_context = f"Available relationships: {', '.join(rel_names)}"
+    
+    prompt = f"""
+You are a Cypher expert. Convert the following natural language question into a valid Cypher query.
+
+Database Schema:
+- Nodes have a 'name' property (no specific label)
+- Relationships are of types like: {', '.join([r['matched'] for r in matched_relationships]) if matched_relationships else 'RELATES'}
+
+Query Requirements:
+- Match nodes based on name (case-insensitive): use toLower(n.name) = toLower('<name>')
+- Use relationship types exactly as provided
+- Do not use hardcoded node labels like :Entity or :Unknown
+- Prefer a simple pattern like: (n)-[:RELATES]->(m)
+
+Question: {nl_query}
+
+Cypher query:
+"""
+    
+    response = llm.predict(prompt).strip()
+    
+    # Extract the Cypher query from the response
+    lines = response.split('\n')
+    for line in lines:
+        if line.strip().startswith("MATCH"):
+            return line.strip()
+    
+    return response.strip()
+
+def run_cypher(cypher_query):
+    """Execute Cypher query against Neo4j"""
+    with driver.session() as session:
+        result = session.run(cypher_query)
+        return [record.data() for record in result]
+
+def generate_answer(question, graph_data):
+    """Generate natural language answer from graph data"""
+    try:
+        trimmed = graph_data[:5]
+        graph_summary = json.dumps(trimmed, indent=2)
+
+        prompt = f"""
+You are an AI assistant helping users answer questions based on knowledge graph data.
+
+Here is the user's question:
+{question}
+
+And here is relevant graph data (first 5 entries):
+{graph_summary}
+
+Based on the graph data, provide a direct and concise answer to the question above. Just provide one answer, with no trailing explanations.
+"""
+
+        answer = llm.predict(prompt).strip()
+        return answer if answer else "Sorry, I couldn't generate an answer from the current data."
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"⚠️ Error generating answer: {str(e)}"
+
+@app.route('/ask', methods=['POST'])
+def ask():
+    try:
+        data = request.get_json()
+        query = data.get('query', '').strip()
+        
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+        
+        # Initialize vector store if not already done
+        if not vector_store:
+            initialize_vector_store()
+        
+        # Step 1: Extract entities from query
+        extracted_entities = extract_entities_from_query(query)
+        print(f"Extracted entities: {extracted_entities}")
+        
+        # Step 2: Find matching entities in knowledge graph
+        matched_entities = find_matching_entities(extracted_entities)
+        print(f"Matched entities: {matched_entities}")
+        
+        # Step 3: Find matching relationships
+        matched_relationships = find_matching_relationships(query)
+        print(f"Matched relationships: {matched_relationships}")
+        
+        # Step 4: Generate Cypher with matched entities and relationships
+        cypher = generate_cypher_with_entities(query, matched_entities, matched_relationships)
+        print(f"Generated Cypher: {cypher}")
+        
+        # Step 5: Execute Cypher query
+        result = run_cypher(cypher)
+        
+        if result:
+            final_answer = generate_answer(query, result)
+            return jsonify({
+                "answer": final_answer,
+                "debug": {
+                    "extracted_entities": extracted_entities,
+                    "matched_entities": matched_entities,
+                    "matched_relationships": matched_relationships,
+                    "cypher_query": cypher,
+                    "result_count": len(result)
+                }
+            })
+        else:
+            return jsonify({"answer": "⚠️ No data found in the graph for this query."})
+            
+    except Exception as e:
+        return jsonify({"error": f"Error processing query: {str(e)}"}), 500
+
+@app.route('/refresh-vector-store', methods=['POST'])
+def refresh_vector_store():
+    """Endpoint to refresh the vector store with latest data"""
+    try:
+        initialize_vector_store()
+        return jsonify({"message": "Vector store refreshed successfully"})
+    except Exception as e:
+        return jsonify({"error": f"Error refreshing vector store: {str(e)}"}), 500
+
+if __name__ == '__main__':
+    # Initialize vector store on startup
+    initialize_vector_store()
+    app.run(debug=True)	
+
+
+
+
+
+

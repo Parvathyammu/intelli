@@ -1,0 +1,25 @@
+{
+  "user_credentials": {
+    "username": "ayyappajith",
+    "password": "Mosdac#1234"
+  },
+  "search_parameters": {
+    "datasetIds": [
+      "3RIMG_L2B_LST",
+      "O3OCM_L2_AOD",
+      "SM_INDEX_V01",
+      "MODIS_NDVI",
+      "WRF_3KM_FCST",
+      "O3_L4_CURRENTS",
+      "ISRO_AWS_LIVE"
+    ],
+    "startTime": "2026-03-17",
+    "endTime": "2026-03-17",
+    "count": "",
+    "boundingBox": "",
+    "gId": ""
+  },
+  "download_options": {
+    "download_directory": "./MOSDAC_Data_Hub/"
+  }
+}

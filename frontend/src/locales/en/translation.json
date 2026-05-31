@@ -1,0 +1,20 @@
+{
+  "chatbot": {
+    "title": "Satellite Data Assistant",
+    "welcome": "Welcome to MOSDAC! How can I help you explore our satellite data archive?",
+    "placeholder": "Ask about satellite data...",
+    "send": "Send",
+    "error": "Error connecting to backend. Please try again.",
+    "noAnswer": "Sorry, I couldn't find anything relevant.",
+    "loading": "Loading..."
+  },
+  "navbar": {
+    "home": "Home",
+    "language": "Language"
+  },
+  "knowledge_graph": {
+    "load": "Load Graph",
+    "title": "Knowledge Graph",
+    "description": "Click \"Load Graph\" to visualize the knowledge network"
+  }
+}

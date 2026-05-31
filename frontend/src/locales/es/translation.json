@@ -1,0 +1,20 @@
+{
+  "chatbot": {
+    "title": "Asistente de Datos de Satélites",
+    "welcome": "¡Bienvenido a MOSDAC! ¿Cómo puedo ayudarte a explorar nuestro archivo de datos de satélites?",
+    "placeholder": "Pregunta sobre datos de satélites...",
+    "send": "Enviar",
+    "error": "Error al conectar con el backend. Por favor, intenta de nuevo.",
+    "noAnswer": "Lo siento, no pude encontrar nada relevante.",
+    "loading": "Cargando..."
+  },
+  "navbar": {
+    "home": "Inicio",
+    "language": "Idioma"
+  },
+  "knowledge_graph": {
+    "load": "Cargar Gráfico",
+    "title": "Gráfico de Conocimiento",
+    "description": "Haz clic en \"Cargar Gráfico\" para visualizar la red de conocimiento"
+  }
+}
